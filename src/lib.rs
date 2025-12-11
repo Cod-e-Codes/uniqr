@@ -440,19 +440,15 @@ fn deduplicate_keep_last_disk<R: std::io::Read + std::io::Seek, W: Write>(
 
     // Pass 1: Track last occurrence index for each key
     let reader = BufReader::new(&mut input);
-    let mut line_index = 0u64;
-
-    for line_result in reader.split(b'\n') {
+    for (line_index, line_result) in reader.split(b'\n').enumerate() {
         let line = line_result?;
         stats.lines_read += 1;
 
         let key = make_key(&line, options)?;
 
         // Store the current line index as the last occurrence
-        db.insert(&key, &line_index.to_le_bytes())
+        db.insert(&key, &(line_index as u64).to_le_bytes())
             .map_err(|e| Error::InvalidArgument(format!("Database error: {}", e)))?;
-
-        line_index += 1;
     }
 
     stats.unique_lines = db.len();
@@ -460,9 +456,7 @@ fn deduplicate_keep_last_disk<R: std::io::Read + std::io::Seek, W: Write>(
     // Pass 2: Re-read file and output only last occurrences
     input.seek(std::io::SeekFrom::Start(0))?;
     let reader = BufReader::new(&mut input);
-    let mut current_index = 0u64;
-
-    for line_result in reader.split(b'\n') {
+    for (current_index, line_result) in reader.split(b'\n').enumerate() {
         let line = line_result?;
         let key = make_key(&line, options)?;
 
@@ -474,7 +468,7 @@ fn deduplicate_keep_last_disk<R: std::io::Read + std::io::Seek, W: Write>(
             bytes.copy_from_slice(&last_index_bytes);
             let last_index = u64::from_le_bytes(bytes);
 
-            if current_index == last_index {
+            if (current_index as u64) == last_index {
                 if options.count {
                     // Count how many times this key appeared (need to count in db)
                     // For simplicity, we'll just show 1 for now
@@ -489,8 +483,6 @@ fn deduplicate_keep_last_disk<R: std::io::Read + std::io::Seek, W: Write>(
                 }
             }
         }
-
-        current_index += 1;
     }
 
     Ok(stats)
