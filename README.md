@@ -10,7 +10,7 @@ A fast line deduplication tool that preserves order, written in Rust.
   - `KeepLast`: Keep the last occurrence of each line
   - `RemoveAll`: Remove all lines that appear more than once
 - **Case-Insensitive Matching**: Optional case-insensitive deduplication
-- **Column-Based Deduplication**: Deduplicate based on specific columns
+- **Column-Based Deduplication**: Deduplicate based on specific columns (uses whitespace splitting)
 - **Statistics**: View deduplication statistics
 - **Fast Hashing**: Optional `ahash` support for improved performance
 - **Disk-Backed Storage**: Handle files that don't fit in RAM using `sled` embedded database (supports accurate counting)

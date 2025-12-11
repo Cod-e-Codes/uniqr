@@ -440,7 +440,7 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
         .open()
         .map_err(|e| Error::InvalidArgument(format!("Failed to create temp database: {}", e)))?;
 
-    let mut lines_for_count = Vec::new();
+    let mut lines_for_count: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line)? > 0 {
@@ -477,7 +477,7 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
 
         if count == 1 {
             if options.count {
-                lines_for_count.push(line.clone());
+                lines_for_count.push((line.clone(), key.clone()));
             } else {
                 output.write_all(&line)?;
             }
@@ -496,8 +496,8 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
 
     // Write counts if requested
     if options.count {
-        for line in lines_for_count {
-            let key = make_key(&line, options)?;
+        for (line, key) in lines_for_count {
+            // Key is already computed and stored
             if let Some(count_bytes) = db
                 .get(&key)
                 .map_err(|e| Error::InvalidArgument(format!("Database error: {}", e)))?
