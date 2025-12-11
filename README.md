@@ -13,7 +13,8 @@ A fast line deduplication tool that preserves order, written in Rust.
 - **Column-Based Deduplication**: Deduplicate based on specific columns
 - **Statistics**: View deduplication statistics
 - **Fast Hashing**: Optional `ahash` support for improved performance
-- **Disk-Backed Storage**: Handle massive files that don't fit in RAM using `sled` embedded database
+- **Disk-Backed Storage**: Handle massive files that don't fit in RAM using `sled` embedded database (supports accurate counting)
+- **Robust Line Handling**: Correctly preserves empty lines and handles mixed line endings
 
 ## Installation
 

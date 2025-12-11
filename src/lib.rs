@@ -105,11 +105,13 @@ pub fn deduplicate<R: std::io::Read, W: Write>(
         }
     }
 
-    match options.mode {
+    let stats = match options.mode {
         DeduplicationMode::KeepFirst => deduplicate_keep_first(input, output, options),
         DeduplicationMode::KeepLast => deduplicate_keep_last(input, output, options),
         DeduplicationMode::RemoveAll => deduplicate_remove_all(input, output, options),
-    }
+    }?;
+    output.flush()?;
+    Ok(stats)
 }
 
 /// Deduplication function for seekable inputs (supports all modes)
@@ -136,7 +138,9 @@ pub fn deduplicate_seekable<R: std::io::Read + std::io::Seek, W: Write>(
     }
 
     // Default to standard deduplicate if disk-backed is not used
-    deduplicate(input, output, options)
+    let stats = deduplicate(input, output, options)?;
+    output.flush()?;
+    Ok(stats)
 }
 
 /// One-pass keep-first algorithm
@@ -145,7 +149,7 @@ fn deduplicate_keep_first<R: std::io::Read, W: Write>(
     output: &mut W,
     options: &DeduplicationOptions,
 ) -> Result<DeduplicationStats> {
-    let reader = BufReader::new(input);
+    let mut reader = BufReader::new(input);
     let mut stats = DeduplicationStats::default();
 
     #[cfg(feature = "fast-hash")]
@@ -157,11 +161,22 @@ fn deduplicate_keep_first<R: std::io::Read, W: Write>(
     let mut seen: MapType = MapType::default();
     let mut lines_for_count = Vec::new();
 
-    for line_result in reader.split(b'\n') {
-        let line = line_result?;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? > 0 {
         stats.lines_read += 1;
 
-        let key = make_key(&line, options)?;
+        // Strip newline for key generation but keep for output
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
         let count = seen.entry(key).or_insert(0);
         *count += 1;
 
@@ -169,15 +184,17 @@ fn deduplicate_keep_first<R: std::io::Read, W: Write>(
             if options.count {
                 lines_for_count.push(line.clone());
             } else {
-                write_line(output, &line)?;
+                output.write_all(&line)?;
             }
             stats.lines_written += 1;
         } else {
             stats.lines_removed += 1;
             if options.show_removed {
-                writeln!(output, "[REMOVED] {}", String::from_utf8_lossy(&line))?;
+                write!(output, "[REMOVED] ")?;
+                output.write_all(&line)?;
             }
         }
+        line.clear();
     }
 
     stats.unique_lines = seen.len();
@@ -185,10 +202,25 @@ fn deduplicate_keep_first<R: std::io::Read, W: Write>(
     // Write counts if requested
     if options.count {
         for line in lines_for_count {
-            let key = make_key(&line, options)?;
+            let _key = make_key(&line, options)?; // Correct key generation logic needed here too if stripping happened above, but line has newline now.
+            // Actually, lines_for_count stores full lines with newlines.
+            // make_key expects just content. We need to strip again or refactor make_key.
+            // Let's strip locally.
+            let key_line = if line.ends_with(b"\n") {
+                if line.ends_with(b"\r\n") {
+                    &line[..line.len() - 2]
+                } else {
+                    &line[..line.len() - 1]
+                }
+            } else {
+                &line[..]
+            };
+
+            let key = make_key(key_line, options)?;
+
             if let Some(&cnt) = seen.get(&key) {
                 write!(output, "{:>7} ", cnt)?;
-                write_line(output, &line)?;
+                output.write_all(&line)?;
             }
         }
     }
@@ -202,7 +234,7 @@ fn deduplicate_keep_last<R: std::io::Read, W: Write>(
     output: &mut W,
     options: &DeduplicationOptions,
 ) -> Result<DeduplicationStats> {
-    let reader = BufReader::new(input);
+    let mut reader = BufReader::new(input);
     let mut stats = DeduplicationStats::default();
 
     #[cfg(feature = "fast-hash")]
@@ -215,13 +247,24 @@ fn deduplicate_keep_last<R: std::io::Read, W: Write>(
     let mut lines = Vec::new();
 
     // First pass: read all lines and track last occurrence
-    for line_result in reader.split(b'\n') {
-        let line = line_result?;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? > 0 {
         stats.lines_read += 1;
 
-        let key = make_key(&line, options)?;
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
         last_occurrence.insert(key, (stats.lines_read - 1, line.clone()));
-        lines.push(line);
+        lines.push(line.clone());
+        line.clear();
     }
 
     stats.unique_lines = last_occurrence.len();
@@ -233,19 +276,41 @@ fn deduplicate_keep_last<R: std::io::Read, W: Write>(
     for (idx, line) in lines.iter().enumerate() {
         if kept_indices.contains(&idx) {
             if options.count {
-                let key = make_key(line, options)?;
+                let key_line = if line.ends_with(b"\n") {
+                    if line.ends_with(b"\r\n") {
+                        &line[..line.len() - 2]
+                    } else {
+                        &line[..line.len() - 1]
+                    }
+                } else {
+                    &line[..]
+                };
+
+                let key = make_key(key_line, options)?;
                 let count = lines
                     .iter()
-                    .filter(|l| make_key(l, options).ok() == Some(key.clone()))
+                    .filter(|l| {
+                        let l_key_line = if l.ends_with(b"\n") {
+                            if l.ends_with(b"\r\n") {
+                                &l[..l.len() - 2]
+                            } else {
+                                &l[..l.len() - 1]
+                            }
+                        } else {
+                            &l[..]
+                        };
+                        make_key(l_key_line, options).ok() == Some(key.clone())
+                    })
                     .count();
                 write!(output, "{:>7} ", count)?;
             }
-            write_line(output, line)?;
+            output.write_all(line)?;
             stats.lines_written += 1;
         } else {
             stats.lines_removed += 1;
             if options.show_removed {
-                writeln!(output, "[REMOVED] {}", String::from_utf8_lossy(line))?;
+                write!(output, "[REMOVED] ")?;
+                output.write_all(line)?;
             }
         }
     }
@@ -259,7 +324,7 @@ fn deduplicate_remove_all<R: std::io::Read, W: Write>(
     output: &mut W,
     options: &DeduplicationOptions,
 ) -> Result<DeduplicationStats> {
-    let reader = BufReader::new(input);
+    let mut reader = BufReader::new(input);
     let mut stats = DeduplicationStats::default();
 
     #[cfg(feature = "fast-hash")]
@@ -272,13 +337,24 @@ fn deduplicate_remove_all<R: std::io::Read, W: Write>(
     let mut lines = Vec::new();
 
     // First pass: count all occurrences
-    for line_result in reader.split(b'\n') {
-        let line = line_result?;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? > 0 {
         stats.lines_read += 1;
 
-        let key = make_key(&line, options)?;
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
         *counts.entry(key).or_insert(0) += 1;
-        lines.push(line);
+        lines.push(line.clone());
+        line.clear();
     }
 
     // Count unique lines (those appearing exactly once)
@@ -286,19 +362,30 @@ fn deduplicate_remove_all<R: std::io::Read, W: Write>(
 
     // Second pass: emit only lines that appear exactly once
     for line in lines {
-        let key = make_key(&line, options)?;
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
         let count = counts.get(&key).copied().unwrap_or(0);
 
         if count == 1 {
             if options.count {
                 write!(output, "{:>7} ", count)?;
             }
-            write_line(output, &line)?;
+            output.write_all(&line)?;
             stats.lines_written += 1;
         } else {
             stats.lines_removed += 1;
             if options.show_removed {
-                writeln!(output, "[REMOVED] {}", String::from_utf8_lossy(&line))?;
+                write!(output, "[REMOVED] ")?;
+                output.write_all(&line)?;
             }
         }
     }
@@ -309,37 +396,30 @@ fn deduplicate_remove_all<R: std::io::Read, W: Write>(
 /// Create deduplication key from line
 fn make_key(line: &[u8], options: &DeduplicationOptions) -> Result<Vec<u8>> {
     let data = if let Some(col_idx) = options.column {
-        // Extract column (1-indexed)
-        let cols: Vec<&[u8]> = line
-            .split(|&b| b == b'\t' || b == b' ')
-            .filter(|s| !s.is_empty())
-            .collect();
+        // Extract column (1-indexed) using whitespace splitting
+        // This handles standard whitespace separation more robustly than manual byte checks
+        let text = String::from_utf8_lossy(line);
+        let cols: Vec<&str> = text.split_whitespace().collect();
 
         if col_idx > 0 && col_idx <= cols.len() {
-            cols[col_idx - 1]
+            // We need to return an owned Vec<u8> because text is temporary
+            cols[col_idx - 1].as_bytes().to_vec()
         } else {
-            line
+            line.to_vec()
         }
     } else {
-        line
+        line.to_vec()
     };
 
     if options.ignore_case {
         // Try to convert to lowercase UTF-8
-        match std::str::from_utf8(data) {
+        match std::str::from_utf8(&data) {
             Ok(s) => Ok(s.to_lowercase().into_bytes()),
-            Err(_) => Ok(data.to_vec()),
+            Err(_) => Ok(data),
         }
     } else {
-        Ok(data.to_vec())
+        Ok(data)
     }
-}
-
-/// Write a line to output with newline
-fn write_line<W: Write>(output: &mut W, line: &[u8]) -> Result<()> {
-    output.write_all(line)?;
-    output.write_all(b"\n")?;
-    Ok(())
 }
 
 /// Disk-backed keep-first algorithm using sled
@@ -351,7 +431,7 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
 ) -> Result<DeduplicationStats> {
     use sled::Db;
 
-    let reader = BufReader::new(input);
+    let mut reader = BufReader::new(input);
     let mut stats = DeduplicationStats::default();
 
     // Create temporary sled database
@@ -362,11 +442,22 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
 
     let mut lines_for_count = Vec::new();
 
-    for line_result in reader.split(b'\n') {
-        let line = line_result?;
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line)? > 0 {
         stats.lines_read += 1;
 
-        let key = make_key(&line, options)?;
+        // Strip newline for key generation but keep for output
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
 
         // Check if we've seen this key before
         let count = if let Some(existing) = db
@@ -388,15 +479,17 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
             if options.count {
                 lines_for_count.push(line.clone());
             } else {
-                write_line(output, &line)?;
+                output.write_all(&line)?;
             }
             stats.lines_written += 1;
         } else {
             stats.lines_removed += 1;
             if options.show_removed {
-                writeln!(output, "[REMOVED] {}", String::from_utf8_lossy(&line))?;
+                write!(output, "[REMOVED] ")?;
+                output.write_all(&line)?;
             }
         }
+        line.clear();
     }
 
     stats.unique_lines = db.len();
@@ -413,7 +506,7 @@ fn deduplicate_keep_first_disk<R: std::io::Read, W: Write>(
                 bytes.copy_from_slice(&count_bytes);
                 let cnt = u64::from_le_bytes(bytes);
                 write!(output, "{:>7} ", cnt)?;
-                write_line(output, &line)?;
+                output.write_all(&line)?;
             }
         }
     }
@@ -439,50 +532,113 @@ fn deduplicate_keep_last_disk<R: std::io::Read + std::io::Seek, W: Write>(
         .map_err(|e| Error::InvalidArgument(format!("Failed to create temp database: {}", e)))?;
 
     // Pass 1: Track last occurrence index for each key
-    let reader = BufReader::new(&mut input);
-    for (line_index, line_result) in reader.split(b'\n').enumerate() {
-        let line = line_result?;
+    let mut reader = BufReader::new(&mut input);
+    let mut line = Vec::new();
+    for (line_index, _) in (0..).enumerate() {
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
         stats.lines_read += 1;
 
-        let key = make_key(&line, options)?;
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
 
-        // Store the current line index as the last occurrence
-        db.insert(&key, &(line_index as u64).to_le_bytes())
+        let key = make_key(key_line, options)?;
+
+        // Retrieve existing data to update count
+        let count = if let Some(existing) = db
+            .get(&key)
+            .map_err(|e| Error::InvalidArgument(format!("Database error: {}", e)))?
+        {
+            // Existing value is 16 bytes: [last_index (8) | count (8)]
+            // Or if we need to migrate/handle unexpected sizes, we can check len.
+            // Since we are creating a temp DB from scratch, we control the layout.
+            if existing.len() == 16 {
+                let mut count_bytes = [0u8; 8];
+                count_bytes.copy_from_slice(&existing[8..16]);
+                u64::from_le_bytes(count_bytes) + 1
+            } else {
+                1
+            }
+        } else {
+            1
+        };
+
+        // Store: line_index (8 bytes) + count (8 bytes)
+        let mut value = [0u8; 16];
+        value[0..8].copy_from_slice(&(line_index as u64).to_le_bytes());
+        value[8..16].copy_from_slice(&count.to_le_bytes());
+
+        db.insert(&key, &value)
             .map_err(|e| Error::InvalidArgument(format!("Database error: {}", e)))?;
+
+        line.clear();
     }
 
     stats.unique_lines = db.len();
 
     // Pass 2: Re-read file and output only last occurrences
     input.seek(std::io::SeekFrom::Start(0))?;
-    let reader = BufReader::new(&mut input);
-    for (current_index, line_result) in reader.split(b'\n').enumerate() {
-        let line = line_result?;
-        let key = make_key(&line, options)?;
+    let mut reader = BufReader::new(&mut input);
+    let mut line = Vec::new();
+
+    for (current_index, _) in (0..).enumerate() {
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
 
         if let Some(last_index_bytes) = db
             .get(&key)
             .map_err(|e| Error::InvalidArgument(format!("Database error: {}", e)))?
         {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&last_index_bytes);
-            let last_index = u64::from_le_bytes(bytes);
+            // Value is 16 bytes: [last_index (8) | count (8)]
+            if last_index_bytes.len() == 16 {
+                let mut index_bytes = [0u8; 8];
+                index_bytes.copy_from_slice(&last_index_bytes[0..8]);
+                let last_index = u64::from_le_bytes(index_bytes);
 
-            if (current_index as u64) == last_index {
-                if options.count {
-                    // Count how many times this key appeared (need to count in db)
-                    // For simplicity, we'll just show 1 for now
-                    write!(output, "{:>7} ", 1)?;
+                if (current_index as u64) == last_index {
+                    if options.count {
+                        let mut count_bytes = [0u8; 8];
+                        count_bytes.copy_from_slice(&last_index_bytes[8..16]);
+                        let count = u64::from_le_bytes(count_bytes);
+                        write!(output, "{:>7} ", count)?;
+                    }
+                    output.write_all(&line)?;
+                    stats.lines_written += 1;
+                } else {
+                    stats.lines_removed += 1;
+                    if options.show_removed {
+                        write!(output, "[REMOVED] ")?;
+                        output.write_all(&line)?;
+                    }
                 }
-                write_line(output, &line)?;
-                stats.lines_written += 1;
             } else {
-                stats.lines_removed += 1;
-                if options.show_removed {
-                    writeln!(output, "[REMOVED] {}", String::from_utf8_lossy(&line))?;
-                }
+                // Fallback for unexpected data format (should not happen with new logic)
+                // Just assume it's index only logic from before? No, let's treat as error or safe fallback using old logic if length is 8.
+                // For now, ignoring to keep simple.
             }
         }
+        line.clear();
     }
 
     Ok(stats)
@@ -506,13 +662,23 @@ fn deduplicate_remove_all_disk<R: std::io::Read + std::io::Seek, W: Write>(
         .map_err(|e| Error::InvalidArgument(format!("Failed to create temp database: {}", e)))?;
 
     // Pass 1: Count occurrences of each key
-    let reader = BufReader::new(&mut input);
+    let mut reader = BufReader::new(&mut input);
+    let mut line = Vec::new();
 
-    for line_result in reader.split(b'\n') {
-        let line = line_result?;
+    while reader.read_until(b'\n', &mut line)? > 0 {
         stats.lines_read += 1;
 
-        let key = make_key(&line, options)?;
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
 
         // Get current count and increment
         let count = if let Some(existing) = db
@@ -528,6 +694,7 @@ fn deduplicate_remove_all_disk<R: std::io::Read + std::io::Seek, W: Write>(
 
         db.insert(&key, &count.to_le_bytes())
             .map_err(|e| Error::InvalidArgument(format!("Database error: {}", e)))?;
+        line.clear();
     }
 
     // Count unique lines (those appearing exactly once)
@@ -544,11 +711,21 @@ fn deduplicate_remove_all_disk<R: std::io::Read + std::io::Seek, W: Write>(
 
     // Pass 2: Re-read file and output only lines that appear exactly once
     input.seek(std::io::SeekFrom::Start(0))?;
-    let reader = BufReader::new(&mut input);
+    let mut reader = BufReader::new(&mut input);
+    let mut line = Vec::new();
 
-    for line_result in reader.split(b'\n') {
-        let line = line_result?;
-        let key = make_key(&line, options)?;
+    while reader.read_until(b'\n', &mut line)? > 0 {
+        let key_line = if line.ends_with(b"\n") {
+            if line.ends_with(b"\r\n") {
+                &line[..line.len() - 2]
+            } else {
+                &line[..line.len() - 1]
+            }
+        } else {
+            &line[..]
+        };
+
+        let key = make_key(key_line, options)?;
 
         if let Some(count_bytes) = db
             .get(&key)
@@ -562,15 +739,17 @@ fn deduplicate_remove_all_disk<R: std::io::Read + std::io::Seek, W: Write>(
                 if options.count {
                     write!(output, "{:>7} ", count)?;
                 }
-                write_line(output, &line)?;
+                output.write_all(&line)?;
                 stats.lines_written += 1;
             } else {
                 stats.lines_removed += 1;
                 if options.show_removed {
-                    writeln!(output, "[REMOVED] {}", String::from_utf8_lossy(&line))?;
+                    write!(output, "[REMOVED] ")?;
+                    output.write_all(&line)?;
                 }
             }
         }
+        line.clear();
     }
 
     Ok(stats)

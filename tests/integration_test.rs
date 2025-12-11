@@ -155,3 +155,46 @@ fn test_column_mode() {
         .success()
         .stdout("1\tapple\n2\tbanana\n");
 }
+
+#[test]
+fn test_keep_last_count() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("uniqr"));
+    cmd.arg("--keep-last")
+        .arg("--count")
+        .write_stdin("a\nb\na\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 a")) // 'a' appears twice, kept last. count should be 2.
+        .stdout(predicate::str::contains("1 b"));
+}
+
+#[test]
+fn test_empty_line_preservation() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("uniqr"));
+    cmd.write_stdin("a\n\nb\n\na\n")
+        .assert()
+        .success()
+        // Deduplicated output:
+        // 1. "a" (seen)
+        // 2. "" (seen)
+        // 3. "b" (seen)
+        // 4. "" (duplicate of 2, removed)
+        // 5. "a" (duplicate of 1, removed)
+        .stdout("a\n\nb\n");
+}
+
+#[test]
+fn test_disk_backed_keep_last_count() {
+    let input_file = NamedTempFile::new().unwrap();
+    fs::write(input_file.path(), "a\nb\na\n").unwrap();
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("uniqr"));
+    cmd.arg("--keep-last")
+        .arg("--count")
+        .arg("--use-disk")
+        .arg(input_file.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 a"))
+        .stdout(predicate::str::contains("1 b"));
+}
