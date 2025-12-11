@@ -81,7 +81,11 @@ pub struct DeduplicationStats {
     pub unique_lines: usize,
 }
 
-/// Main deduplication function
+/// Main deduplication function (safe for non-seekable streams)
+///
+/// Note: This function cannot perform disk-backed two-pass deduplication
+/// (`KeepLast` or `RemoveAll` with `use_disk: true`) because they require
+/// a seekable input source. Use `deduplicate_seekable` for those cases.
 pub fn deduplicate<R: std::io::Read, W: Write>(
     input: R,
     output: &mut W,
@@ -89,11 +93,16 @@ pub fn deduplicate<R: std::io::Read, W: Write>(
 ) -> Result<DeduplicationStats> {
     #[cfg(feature = "disk-backed")]
     if options.use_disk {
-        return match options.mode {
-            DeduplicationMode::KeepFirst => deduplicate_keep_first_disk(input, output, options),
-            DeduplicationMode::KeepLast => deduplicate_keep_last_disk(input, output, options),
-            DeduplicationMode::RemoveAll => deduplicate_remove_all_disk(input, output, options),
-        };
+        match options.mode {
+            DeduplicationMode::KeepFirst => {
+                return deduplicate_keep_first_disk(input, output, options);
+            }
+            DeduplicationMode::KeepLast | DeduplicationMode::RemoveAll => {
+                return Err(Error::InvalidArgument(
+                    "Disk-backed KeepLast and RemoveAll modes require a seekable input. Use deduplicate_seekable() or provide a file.".to_string(),
+                ));
+            }
+        }
     }
 
     match options.mode {
@@ -101,6 +110,33 @@ pub fn deduplicate<R: std::io::Read, W: Write>(
         DeduplicationMode::KeepLast => deduplicate_keep_last(input, output, options),
         DeduplicationMode::RemoveAll => deduplicate_remove_all(input, output, options),
     }
+}
+
+/// Deduplication function for seekable inputs (supports all modes)
+pub fn deduplicate_seekable<R: std::io::Read + std::io::Seek, W: Write>(
+    input: R,
+    output: &mut W,
+    options: &DeduplicationOptions,
+) -> Result<DeduplicationStats> {
+    #[cfg(feature = "disk-backed")]
+    if options.use_disk {
+        match options.mode {
+            DeduplicationMode::KeepLast => {
+                return deduplicate_keep_last_disk(input, output, options);
+            }
+            DeduplicationMode::RemoveAll => {
+                return deduplicate_remove_all_disk(input, output, options);
+            }
+            _ => {
+                // KeepFirst (disk) and in-memory modes don't strictly *need* Seek,
+                // so we can delegate to the standard function.
+                return deduplicate(input, output, options);
+            }
+        }
+    }
+
+    // Default to standard deduplicate if disk-backed is not used
+    deduplicate(input, output, options)
 }
 
 /// One-pass keep-first algorithm
@@ -668,7 +704,7 @@ mod tests {
             use_disk: true,
             ..Default::default()
         };
-        let stats = deduplicate(&mut cursor, &mut output, &opts).unwrap();
+        let stats = deduplicate_seekable(&mut cursor, &mut output, &opts).unwrap();
 
         assert_eq!(output, b"b\na\nc\n");
         assert_eq!(stats.lines_written, 3);
@@ -688,7 +724,7 @@ mod tests {
             use_disk: true,
             ..Default::default()
         };
-        let stats = deduplicate(&mut cursor, &mut output, &opts).unwrap();
+        let stats = deduplicate_seekable(&mut cursor, &mut output, &opts).unwrap();
 
         assert_eq!(output, b"b\nc\n");
         assert_eq!(stats.unique_lines, 2);

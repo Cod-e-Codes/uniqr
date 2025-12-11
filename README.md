@@ -89,6 +89,8 @@ deduplicate(Cursor::new(input), &mut output, &options).unwrap();
 assert_eq!(output, b"line1\nline2\nline3\n");
 ```
 
+> **Note**: For disk-backed `KeepLast` and `RemoveAll` modes, use `deduplicate_seekable` instead of `deduplicate` as these modes require a seekable input source.
+
 ## Why uniqr?
 
 The standard Unix `uniq` command only removes **adjacent** duplicates. To remove all duplicates, you must use `sort | uniq`, which destroys the original order of lines.

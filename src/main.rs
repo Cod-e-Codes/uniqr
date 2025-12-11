@@ -107,64 +107,107 @@ fn run() -> Result<(), Error> {
         ));
     }
 
-    // Open input
-    let input: Box<dyn io::Read> = match cli.input {
-        Some(path) => Box::new(File::open(&path).map_err(|e| {
+    // Open input and perform deduplication with appropriate trait bounds
+    let stats = if let Some(path) = cli.input {
+        // File input is seekable
+        let file = File::open(&path).map_err(|e| {
             Error::Io(io::Error::new(
                 e.kind(),
                 format!("Failed to open input file '{}': {}", path.display(), e),
             ))
-        })?),
-        None => Box::new(io::stdin()),
-    };
-
-    // Prepare output
-    let stats = if cli.dry_run {
-        // Dry run: write to /dev/null equivalent
-        let mut null_output = io::sink();
-        deduplicate(input, &mut null_output, &options)?
-    } else if let Some(output_path) = cli.output {
-        // Atomic file write using temp file
-        let temp_path = output_path.with_extension("tmp");
-
-        let temp_file = File::create(&temp_path).map_err(|e| {
-            Error::Io(io::Error::new(
-                e.kind(),
-                format!(
-                    "Failed to create temp file '{}': {}",
-                    temp_path.display(),
-                    e
-                ),
-            ))
         })?;
 
-        let mut writer = BufWriter::new(temp_file);
-        let stats = deduplicate(input, &mut writer, &options)?;
+        // Prepare output
+        if cli.dry_run {
+            let mut null_output = io::sink();
+            uniqr::deduplicate_seekable(file, &mut null_output, &options)?
+        } else if let Some(output_path) = cli.output {
+            // Atomic file write setup
+            let temp_path = output_path.with_extension("tmp");
+            let temp_file = File::create(&temp_path).map_err(|e| {
+                Error::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to create temp file '{}': {}",
+                        temp_path.display(),
+                        e
+                    ),
+                ))
+            })?;
+            let mut writer = BufWriter::new(temp_file);
 
-        writer.flush()?;
-        drop(writer);
+            let stats = uniqr::deduplicate_seekable(file, &mut writer, &options)?;
 
-        // Atomic rename
-        std::fs::rename(&temp_path, &output_path).map_err(|e| {
-            Error::Io(io::Error::new(
-                e.kind(),
-                format!(
-                    "Failed to rename '{}' to '{}': {}",
-                    temp_path.display(),
-                    output_path.display(),
-                    e
-                ),
-            ))
-        })?;
-
-        stats
+            writer.flush()?;
+            drop(writer);
+            std::fs::rename(&temp_path, &output_path).map_err(|e| {
+                Error::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to rename '{}' to '{}': {}",
+                        temp_path.display(),
+                        output_path.display(),
+                        e
+                    ),
+                ))
+            })?;
+            stats
+        } else {
+            // Write to stdout
+            let stdout = io::stdout();
+            let mut writer = BufWriter::new(stdout.lock());
+            let stats = uniqr::deduplicate_seekable(file, &mut writer, &options)?;
+            writer.flush()?;
+            stats
+        }
     } else {
-        // Write to stdout
-        let stdout = io::stdout();
-        let mut writer = BufWriter::new(stdout.lock());
-        let stats = deduplicate(input, &mut writer, &options)?;
-        writer.flush()?;
-        stats
+        // Stdin input (not seekable via standard Stdin handle)
+        let stdin = io::stdin();
+        let input = stdin.lock(); // StdinLock implements Read
+
+        // Prepare output
+        if cli.dry_run {
+            let mut null_output = io::sink();
+            deduplicate(input, &mut null_output, &options)?
+        } else if let Some(output_path) = cli.output {
+            // Atomic file write setup for Stdin input
+            let temp_path = output_path.with_extension("tmp");
+            let temp_file = File::create(&temp_path).map_err(|e| {
+                Error::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to create temp file '{}': {}",
+                        temp_path.display(),
+                        e
+                    ),
+                ))
+            })?;
+            let mut writer = BufWriter::new(temp_file);
+
+            let stats = deduplicate(input, &mut writer, &options)?;
+
+            writer.flush()?;
+            drop(writer);
+            std::fs::rename(&temp_path, &output_path).map_err(|e| {
+                Error::Io(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to rename '{}' to '{}': {}",
+                        temp_path.display(),
+                        output_path.display(),
+                        e
+                    ),
+                ))
+            })?;
+            stats
+        } else {
+            // Write to stdout
+            let stdout = io::stdout();
+            let mut writer = BufWriter::new(stdout.lock());
+            let stats = deduplicate(input, &mut writer, &options)?;
+            writer.flush()?;
+            stats
+        }
     };
 
     // Print statistics if requested
